@@ -6,7 +6,7 @@ and carry enough provenance to reproduce any query.
 """
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timezone
 from enum import Enum
 from typing import Optional
 
@@ -40,7 +40,7 @@ class ObservationRecord(BaseModel):
     instrument: Optional[str] = None
     facility: Optional[str] = None
     s_region: Optional[str] = Field(None, description="Spatial footprint (STC-S)")
-    fetched_at: datetime = Field(default_factory=datetime.utcnow)
+    fetched_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
 
     @field_validator("em_min_um", mode="before")
     @classmethod
@@ -65,7 +65,7 @@ class TimelineResponse(BaseModel):
     releases_queried: list[str]
     total: int
     warnings: list[str] = []
-    fetched_at: datetime = Field(default_factory=datetime.utcnow)
+    fetched_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
 
 
 class PreviewRecord(BaseModel):

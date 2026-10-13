@@ -30,13 +30,15 @@ def validate_size(size_deg: float, max_deg: float = 0.5) -> None:
 
 
 def sanitise_obs_id(obs_id: str) -> str:
-    """Strip characters that would be unsafe in cache filenames."""
+    """Validate and sanitise observation ID — prevent path traversal."""
+    if ".." in obs_id or "/" in obs_id or "\\" in obs_id:
+        raise HTTPException(status_code=422, detail=f"Observation ID contains invalid characters: {obs_id!r}")
     allowed = set(
         "abcdefghijklmnopqrstuvwxyz"
         "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
-        "0123456789-_./:"
+        "0123456789-_."
     )
     cleaned = "".join(c for c in obs_id if c in allowed)
-    if len(cleaned) < 4:
+    if len(cleaned) < 4 or cleaned != obs_id:
         raise HTTPException(status_code=422, detail=f"Invalid observation ID: {obs_id!r}")
     return cleaned
