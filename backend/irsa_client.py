@@ -123,20 +123,41 @@ async def _query_sia(
     resp = await client.get(url, timeout=settings.http_timeout)
     resp.raise_for_status()
 
-    body = resp.json()
-    # IRSA JSON SIA: top-level keys vary; try common structures
     rows: list[dict] = []
-    if isinstance(body, list):
-        rows = body
-    elif isinstance(body, dict):
-        # {"data": [...]} or {"results": [...]} or {"rows": [...]}
-        for key in ("data", "results", "rows", "table"):
-            if key in body and isinstance(body[key], list):
-                rows = body[key]
-                break
-        if not rows:
-            # Flat dict with column arrays — rare but handle
-            logger.debug("Unexpected SIA JSON shape: %s", list(body.keys())[:10])
+    content_type = resp.headers.get("content-type", "").lower()
+    raw_content = resp.content.strip()
+
+    # Check for VOTable XML response
+    if "votable" in content_type or "xml" in content_type or raw_content.startswith(b"<?xml"):
+        try:
+            import io
+            from astropy.io.votable import parse_single_table
+            table = parse_single_table(io.BytesIO(resp.content))
+            field_names = [f.name for f in table.fields]
+            for arr_row in table.array:
+                row_dict = {}
+                for i, name in enumerate(field_names):
+                    val = arr_row[i]
+                    if isinstance(val, (bytes, bytearray)):
+                        val = val.decode("utf-8", errors="replace")
+                    row_dict[name] = val
+                rows.append(row_dict)
+        except Exception as exc:
+            logger.warning("VOTable parse error for %s: %s", collection, exc)
+
+    # Fallback to JSON parsing if no VOTable rows found
+    if not rows:
+        try:
+            body = resp.json()
+            if isinstance(body, list):
+                rows = body
+            elif isinstance(body, dict):
+                for key in ("data", "results", "rows", "table"):
+                    if key in body and isinstance(body[key], list):
+                        rows = body[key]
+                        break
+        except Exception as exc:
+            logger.debug("SIA response is not JSON (%s): %s", collection, exc)
 
     records = [r for r in (_parse_row(row, collection) for row in rows) if r is not None]
     logger.info("SIA %s → %d records (raw=%d)", collection, len(records), len(rows))
