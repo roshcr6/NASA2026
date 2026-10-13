@@ -104,7 +104,7 @@ async def _query_sia(
     ra: float,
     dec: float,
     radius_deg: float,
-    maxrec: int = 50,
+    maxrec: int = 25,
 ) -> list[ObservationRecord]:
     """
     Execute one SIA v2 query and return parsed ObservationRecord list.
@@ -114,13 +114,13 @@ async def _query_sia(
         "COLLECTION": collection,
         "POS": f"CIRCLE {ra} {dec} {radius_deg}",
         "CALIB": "2",           # Level-2 calibrated science products only
-        "RESPONSEFORMAT": "JSON",
         "MAXREC": str(maxrec),
     }
     url = f"{settings.irsa_sia_url}?{urlencode(params)}"
     logger.info("SIA query → %s", url)
 
-    resp = await client.get(url, timeout=settings.http_timeout)
+    timeout = max(settings.http_timeout, 45.0)
+    resp = await client.get(url, timeout=timeout)
     resp.raise_for_status()
 
     rows: list[dict] = []
