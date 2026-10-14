@@ -13,8 +13,7 @@ Scientific constraints honoured:
   - Stretch parameters recorded in preview metadata.
   - Never silently produces a blank image; raises if data is unusable.
 """
-from __future__ import annotations
-
+from concurrent.futures import ThreadPoolExecutor
 import io
 import logging
 import os
@@ -28,6 +27,13 @@ from PIL import Image
 from config import settings
 
 logger = logging.getLogger(__name__)
+
+# Dedicated CPU Worker Pool for parallel FITS parsing, WCS extraction & PNG encoding
+_CPU_WORKERS = max(4, min(os.cpu_count() or 4, 16))
+_CPU_POOL = ThreadPoolExecutor(
+    max_workers=_CPU_WORKERS,
+    thread_name_prefix="fits-cpu-worker",
+)
 
 # ── FITS loading (deferred import — astropy is large) ────────────────────────
 
@@ -242,6 +248,42 @@ async def download_cutout(
     raise ValueError("All cutout and archive download attempts failed.")
 
 
+def _cpu_process_fits(
+    raw_fits: bytes,
+    ra: float,
+    dec: float,
+    size_deg: float,
+    needs_crop: bool,
+    max_px: int,
+) -> tuple[bytes, dict]:
+    """CPU-bound task executed in worker thread pool across CPU cores."""
+    image_array, fits_meta = _load_fits_image(
+        raw_fits,
+        ra=ra,
+        dec=dec,
+        size_deg=size_deg,
+        needs_crop=needs_crop,
+    )
+    warnings: list[str] = []
+    if "FLAGS" not in fits_meta.get("extensions", []):
+        warnings.append("FLAGS extension not found — bad pixels may not be masked.")
+
+    stretched = _asinh_stretch(image_array)
+    png_bytes = _array_to_png(stretched, max_px=max_px)
+
+    meta = {
+        "stretch": "asinh",
+        "lo_pct": 0.5,
+        "hi_pct": 99.5,
+        "naxis1": fits_meta.get("naxis1"),
+        "naxis2": fits_meta.get("naxis2"),
+        "extensions": fits_meta.get("extensions", []),
+        "wavelength_um": fits_meta.get("wavelength_um"),
+        "warnings": warnings,
+    }
+    return png_bytes, meta
+
+
 # ── Public pipeline entry point ───────────────────────────────────────────────
 
 
@@ -254,42 +296,26 @@ async def generate_preview(
     client: httpx.AsyncClient,
 ) -> tuple[bytes, dict]:
     """
-    Full pipeline: download FITS → parse/cutout → stretch → PNG.
+    Full pipeline: asynchronous download FITS → parallel multi-threaded CPU processing → PNG.
     Returns (png_bytes, metadata_dict).
     """
-    warnings: list[str] = []
+    import asyncio
 
     raw_fits, needs_crop = await download_cutout(access_url, ra, dec, size_deg, client)
 
+    loop = asyncio.get_running_loop()
     try:
-        image_array, fits_meta = _load_fits_image(
+        png_bytes, meta = await loop.run_in_executor(
+            _CPU_POOL,
+            _cpu_process_fits,
             raw_fits,
-            ra=ra,
-            dec=dec,
-            size_deg=size_deg,
-            needs_crop=needs_crop,
+            ra,
+            dec,
+            size_deg,
+            needs_crop,
+            settings.preview_max_px,
         )
     except Exception as exc:
-        raise ValueError(f"FITS parse failed for {obs_id}: {exc}") from exc
+        raise ValueError(f"FITS parse/stretch failed for {obs_id}: {exc}") from exc
 
-    if "FLAGS" not in fits_meta.get("extensions", []):
-        warnings.append("FLAGS extension not found — bad pixels may not be masked.")
-
-    try:
-        stretched = _asinh_stretch(image_array)
-    except ValueError as exc:
-        raise ValueError(f"Image stretch failed for {obs_id}: {exc}") from exc
-
-    png_bytes = _array_to_png(stretched, max_px=settings.preview_max_px)
-
-    meta = {
-        "stretch": "asinh",
-        "lo_pct": 0.5,
-        "hi_pct": 99.5,
-        "naxis1": fits_meta.get("naxis1"),
-        "naxis2": fits_meta.get("naxis2"),
-        "extensions": fits_meta.get("extensions", []),
-        "wavelength_um": fits_meta.get("wavelength_um"),
-        "warnings": warnings,
-    }
     return png_bytes, meta

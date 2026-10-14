@@ -9,10 +9,11 @@ import httpx
 from fastapi import APIRouter, HTTPException, Query
 from fastapi.responses import Response
 
+from pydantic import BaseModel
 from cache import get_preview, put_preview
 from config import settings
 from image_pipeline import generate_preview
-from irsa_client import search_observations
+from irsa_client import search_observations, get_cached_access_url
 from validation import validate_coordinates, validate_size, sanitise_obs_id
 
 router = APIRouter(tags=["preview"])
@@ -26,6 +27,73 @@ def _get_lock(key: str) -> asyncio.Lock:
     if key not in _preview_locks:
         _preview_locks[key] = asyncio.Lock()
     return _preview_locks[key]
+
+
+class BatchPrefetchItem(BaseModel):
+    obs_id: str
+    ra: float
+    dec: float
+    size: float = 0.1
+    collection: str = "spherex_qr3"
+
+
+class BatchPrefetchRequest(BaseModel):
+    items: list[BatchPrefetchItem]
+
+
+@router.post(
+    "/preview/batch-prefetch",
+    summary="Concurrently prefetch and warm cache for multiple observations",
+)
+async def batch_prefetch(request: BatchPrefetchRequest):
+    """
+    Parallel background prefetcher. Uses bounded concurrency to download and
+    warm the disk cache with PNG previews across worker threads.
+    """
+    semaphore = asyncio.Semaphore(settings.max_concurrent_requests)
+
+    async def prefetch_one(item: BatchPrefetchItem) -> bool:
+        cache_key = f"{item.obs_id}|{item.ra}|{item.dec}|{item.size}|{item.collection}"
+        lock = _get_lock(cache_key)
+        async with lock:
+            cached = await get_preview(item.obs_id, item.ra, item.dec, item.size, item.collection)
+            if cached:
+                return True
+            access_url = get_cached_access_url(item.obs_id, item.collection)
+            if not access_url:
+                records, _ = await search_observations(item.ra, item.dec, radius_deg=min(item.size * 2, 0.5))
+                for r in records:
+                    if r.obs_id == item.obs_id:
+                        access_url = r.access_url
+                        break
+            if not access_url:
+                return False
+            async with semaphore:
+                try:
+                    async with httpx.AsyncClient(
+                        headers={"User-Agent": "SPHEREx-SkyExplorer/1.0"},
+                        follow_redirects=True,
+                    ) as client:
+                        png_bytes, meta = await generate_preview(
+                            access_url=access_url,
+                            ra=item.ra,
+                            dec=item.dec,
+                            size_deg=item.size,
+                            obs_id=item.obs_id,
+                            client=client,
+                        )
+                        meta["obs_id"] = item.obs_id
+                        meta["collection"] = item.collection
+                        await put_preview(item.obs_id, item.ra, item.dec, item.size, item.collection, png_bytes, meta)
+                        return True
+                except Exception as exc:
+                    logger.warning("Prefetch failed for %s: %s", item.obs_id, exc)
+                    return False
+
+    tasks = [prefetch_one(item) for item in request.items[:12]]
+    results = await asyncio.gather(*tasks, return_exceptions=True)
+    success_count = sum(1 for r in results if r is True)
+    return {"status": "ok", "total": len(request.items), "success": success_count}
 
 
 @router.get(
@@ -50,13 +118,10 @@ async def get_preview_image(
     Serve a PNG preview for one SPHEREx observation.
 
     1. Check disk cache.
-    2. Look up access_url via SIA (validates obs_id belongs to an allowed dataset).
-    3. Download FITS cutout from IRSA.
-    4. Process and cache PNG.
-    5. Return image with provenance headers.
-
-    The obs_id is validated against the live archive — arbitrary URLs cannot
-    be fetched via this endpoint (SSRF prevention).
+    2. Fast lookup of access_url via in-memory index or SIA.
+    3. Download FITS cutout from IRSA or S3 mirror.
+    4. Offload CPU FITS stretch & PNG generation to thread pool.
+    5. Cache and return image with provenance headers.
     """
     validate_coordinates(ra, dec)
     validate_size(size)
@@ -73,23 +138,25 @@ async def get_preview_image(
             logger.info("Preview cache hit: %s", obs_id)
             return _build_response(png_bytes, meta, obs_id, ra, dec, collection)
 
-        # Validate that obs_id actually belongs to this collection
-        records, _ = await search_observations(ra, dec, radius_deg=min(size * 2, 0.5))
-        matching = [r for r in records if r.obs_id == obs_id and r.collection == collection]
+        # 1. Fast lookup from in-memory access map
+        access_url = get_cached_access_url(obs_id, collection)
 
-        if not matching:
-            # Wider search fallback
-            records, _ = await search_observations(ra, dec, radius_deg=0.3)
-            matching = [r for r in records if r.obs_id == obs_id]
+        # 2. If not found in RAM map, query SIA
+        if not access_url:
+            records, _ = await search_observations(ra, dec, radius_deg=min(size * 2, 0.5))
+            matching = [r for r in records if r.obs_id == obs_id and r.collection == collection]
 
-        if not matching:
-            raise HTTPException(
-                status_code=404,
-                detail=f"Observation {obs_id!r} not found in SPHEREx archive for this position.",
-            )
+            if not matching:
+                # Wider search fallback
+                records, _ = await search_observations(ra, dec, radius_deg=0.3)
+                matching = [r for r in records if r.obs_id == obs_id]
 
-        record = matching[0]
-        access_url = record.access_url
+            if not matching:
+                raise HTTPException(
+                    status_code=404,
+                    detail=f"Observation {obs_id!r} not found in SPHEREx archive for this position.",
+                )
+            access_url = matching[0].access_url
 
         # Download + process
         try:

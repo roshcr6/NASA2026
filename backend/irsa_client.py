@@ -29,6 +29,22 @@ logger = logging.getLogger(__name__)
 # Global semaphore — limits total parallel IRSA requests across all users
 _sem = asyncio.Semaphore(settings.max_concurrent_requests)
 
+# In-memory fast cache mapping (obs_id, collection) -> access_url
+_OBS_ACCESS_MAP: dict[tuple[str, str], str] = {}
+
+
+def get_cached_access_url(obs_id: str, collection: str) -> Optional[str]:
+    """Retrieve fast in-memory access URL discovered during recent SIA searches."""
+    return _OBS_ACCESS_MAP.get((obs_id, collection))
+
+
+def cache_access_url(obs_id: str, collection: str, access_url: str) -> None:
+    """Store fast mapping for observation access URL."""
+    if len(_OBS_ACCESS_MAP) > 4000:
+        _OBS_ACCESS_MAP.clear()
+    _OBS_ACCESS_MAP[(obs_id, collection)] = access_url
+
+
 # ── Internal helpers ──────────────────────────────────────────────────────────
 
 
@@ -68,6 +84,7 @@ def _parse_row(row: dict, collection: str) -> Optional[ObservationRecord]:
             return None
 
         obs_id = str(row.get("obs_id") or row.get("obs_publisher_did") or access_url)
+        cache_access_url(obs_id, collection, access_url)
         mjd_start = _safe_float(row.get("t_min"))
         mjd_stop  = _safe_float(row.get("t_max"))
         em_min    = _safe_float(row.get("em_min"))

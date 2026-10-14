@@ -1,0 +1,1 @@
+{"stretch": "asinh", "lo_pct": 0.5, "hi_pct": 99.5, "naxis1": 59, "naxis2": 58, "extensions": ["PRIMARY", "IMAGE", "FLAGS", "VARIANCE", "ZODI", "PSF", "WCS-WAVE"], "wavelength_um": null, "warnings": [], "obs_id": "2025W51_1A_0289_3", "collection": "spherex_qr2", "access_url_domain": "irsa.ipac.caltech.edu"}
